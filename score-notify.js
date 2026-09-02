@@ -1,84 +1,162 @@
+#!/usr/bin/env node
 /**
- * 轮询 ESPN 德乙 scoreboard，检测 SV 07 Elversberg vs Eintracht Braunschweig 比分变化并弹出系统通知。
- * 运行: node score-notify.js
- * 若该场在德甲，将 SCOREBOARD_URL 中的 ger.2 改为 ger.1。
+ * GoalAlert - desktop notifications when the score of a football match changes.
+ *
+ * Polls the (unofficial) ESPN scoreboard API. No API key required.
+ *
+ *   node score-notify.js --league ger.2 --match elversberg,braunschweig
+ *   node score-notify.js --league eng.1 --match arsenal --interval 30
  */
-import { createRequire } from 'module';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+
 const require = createRequire(import.meta.url);
-const notifier = require('node-notifier');
 
-const SCOREBOARD_URL = 'https://site.api.espn.com/apis/site/v2/sports/soccer/ger.2/scoreboard';
-const POLL_INTERVAL_MS = 20 * 1000; // 20 秒
+export const DEFAULTS = { league: 'ger.2', match: 'elversberg,braunschweig', interval: 20 };
 
-const TARGET_MATCH_LABEL = 'SV 07 Elversberg vs Eintracht Braunschweig';
+const HELP = `GoalAlert - desktop notifications when a football score changes.
 
-function isTargetMatch(event) {
-  const name = (event.name || '').toLowerCase();
-  const short = (event.shortName || '').toLowerCase();
-  const text = name + ' ' + short;
-  const hasElversberg = text.includes('elversberg');
-  const hasBraunschweig = text.includes('braunschweig');
-  return hasElversberg && hasBraunschweig;
+Usage: node score-notify.js [options]
+
+Options:
+  --league <code>     ESPN league code (default: ${DEFAULTS.league}).
+                      Examples: ger.1, ger.2, eng.1, esp.1, ita.1, fra.1, aus.1, tur.1
+  --match <keywords>  Comma-separated keywords that must ALL appear in the event
+                      name, case-insensitive (default: ${DEFAULTS.match})
+  --interval <sec>    Poll interval in seconds, minimum 5 (default: ${DEFAULTS.interval})
+  --once              Fetch once, print the current score and exit
+  -h, --help          Show this help
+`;
+
+export function scoreboardUrl(league) {
+  return `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(league)}/scoreboard`;
 }
 
-function getScoreFromEvent(event) {
-  const comp = event.competitions?.[0];
+export function parseKeywords(match) {
+  return String(match)
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+export function isTargetMatch(event, keywords) {
+  const text = `${event?.name ?? ''} ${event?.shortName ?? ''}`.toLowerCase();
+  return keywords.length > 0 && keywords.every((k) => text.includes(k));
+}
+
+export function getScoreFromEvent(event) {
+  const comp = event?.competitions?.[0];
   if (!comp?.competitors?.length) return null;
   const home = comp.competitors.find((c) => c.homeAway === 'home');
   const away = comp.competitors.find((c) => c.homeAway === 'away');
   if (!home || !away) return null;
-  const homeName = home.team?.displayName || home.team?.name || 'Home';
-  const awayName = away.team?.displayName || away.team?.name || 'Away';
-  const scoreStr = `${home.score}-${away.score}`;
-  return { scoreStr, homeName, awayName, status: comp.status };
+  const nameOf = (t) => t.team?.displayName || t.team?.name || t.homeAway;
+  return {
+    homeName: nameOf(home),
+    awayName: nameOf(away),
+    scoreStr: `${home.score}-${away.score}`,
+    clock: comp.status?.displayClock ?? '',
+    state: comp.status?.type?.description ?? '',
+  };
 }
 
-async function fetchScoreboard() {
-  const res = await fetch(SCOREBOARD_URL);
+export function formatScore(score) {
+  return `${score.homeName} ${score.scoreStr.replace('-', ' - ')} ${score.awayName}`;
+}
+
+async function fetchScoreboard(url) {
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-function runNotification(current) {
-  const message = `${current.homeName} ${current.scoreStr.replace('-', ' - ')} ${current.awayName}`;
-  notifier.notify({ title: '比分变化', message });
-  console.log(`[通知] ${message}`);
+function desktopNotify(message) {
+  const notifier = require('node-notifier');
+  notifier.notify({ title: 'GoalAlert', message });
 }
 
-async function poll(lastScore) {
-  try {
-    const data = await fetchScoreboard();
-    const events = data.events || [];
-    const event = events.find(isTargetMatch);
-    if (!event) {
-      console.log('[轮询] 未找到目标场次 (' + TARGET_MATCH_LABEL + ')');
-      return lastScore;
-    }
-    const current = getScoreFromEvent(event);
-    if (!current) {
-      console.log('[轮询] 无法解析比分');
-      return lastScore;
-    }
-    const detail = event.competitions?.[0]?.status?.displayClock ?? '';
-    console.log(`[轮询] ${current.homeName} ${current.scoreStr} ${current.awayName} ${detail}`);
-
-    if (lastScore !== null && lastScore !== current.scoreStr) {
-      runNotification(current);
-    }
-    return current.scoreStr;
-  } catch (err) {
-    console.error('[轮询] 请求失败:', err.message);
+/**
+ * One polling step. Returns the score string to remember for the next step.
+ * I/O is injectable so the logic can be unit-tested without network or notifications.
+ */
+export async function pollOnce({
+  url,
+  keywords,
+  lastScore,
+  fetchFn = fetchScoreboard,
+  notifyFn = desktopNotify,
+  log = console.log,
+}) {
+  const data = await fetchFn(url);
+  const event = (data.events || []).find((e) => isTargetMatch(e, keywords));
+  if (!event) {
+    log(`[poll] no event matching "${keywords.join(', ')}"`);
     return lastScore;
   }
+  const current = getScoreFromEvent(event);
+  if (!current) {
+    log('[poll] could not parse score');
+    return lastScore;
+  }
+  log(`[poll] ${formatScore(current)} ${current.clock} ${current.state}`.trim());
+  if (lastScore !== null && lastScore !== current.scoreStr) {
+    notifyFn(formatScore(current));
+    log(`[notify] ${formatScore(current)}`);
+  }
+  return current.scoreStr;
+}
+
+export function parseCli(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      league: { type: 'string', default: DEFAULTS.league },
+      match: { type: 'string', default: DEFAULTS.match },
+      interval: { type: 'string', default: String(DEFAULTS.interval) },
+      once: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+  });
+  const interval = Number(values.interval);
+  if (!Number.isFinite(interval) || interval < 5) {
+    throw new Error('--interval must be a number >= 5');
+  }
+  const keywords = parseKeywords(values.match);
+  if (keywords.length === 0) throw new Error('--match needs at least one keyword');
+  return { ...values, interval, keywords };
 }
 
 async function main() {
-  console.log('ESPN 比分变化提醒已启动，监控', TARGET_MATCH_LABEL + '，每', POLL_INTERVAL_MS / 1000, '秒轮询一次。Ctrl+C 退出。\n');
+  let opts;
+  try {
+    opts = parseCli(process.argv.slice(2));
+  } catch (err) {
+    console.error(err.message);
+    console.error(HELP);
+    process.exit(2);
+  }
+  if (opts.help) {
+    console.log(HELP);
+    return;
+  }
+  const url = scoreboardUrl(opts.league);
+  console.log(
+    `GoalAlert: watching "${opts.keywords.join(', ')}" in ${opts.league}, ` +
+      `polling every ${opts.interval}s. Press Ctrl+C to quit.\n`,
+  );
   let lastScore = null;
   for (;;) {
-    lastScore = await poll(lastScore);
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    try {
+      lastScore = await pollOnce({ url, keywords: opts.keywords, lastScore });
+    } catch (err) {
+      console.error('[poll] request failed:', err.message);
+    }
+    if (opts.once) return;
+    await new Promise((resolve) => setTimeout(resolve, opts.interval * 1000));
   }
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

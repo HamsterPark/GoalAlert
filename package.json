@@ -1,6 +1,18 @@
 {
   "name": "goal-alert",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Desktop notifications when the score of a football match changes. Polls the ESPN scoreboard; no API key needed.",
   "type": "module",
+  "main": "score-notify.js",
+  "scripts": {
+    "start": "node score-notify.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "license": "MIT",
   "dependencies": {
     "node-notifier": "^10.0.1"
   }
